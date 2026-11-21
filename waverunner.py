@@ -251,8 +251,6 @@ class Engine:
                 self.log('Could not find the game input surface - dock again.')
                 return
         self.stop_event.clear()
-        if CONFIG['keep_awake']:
-            background.keep_awake()
         self.thread = threading.Thread(target=self._loop, daemon=True)
         self.thread.start()
         self.log('Running {} steps{} in {} mode.'.format(
@@ -268,6 +266,9 @@ class Engine:
             self.start()
 
     def _loop(self) -> None:
+        # Set and cleared on this same thread: the flag is per-thread state.
+        if CONFIG['keep_awake']:
+            background.keep_awake()
         try:
             while not self.stop_event.is_set():
                 if not self._run_once():
@@ -284,7 +285,7 @@ class Engine:
         for index, step in enumerate(self.routine, start=1):
             if self.stop_event.is_set():
                 return False
-            if self.mode() == 'foreground' and CONFIG['require_focus'] and self._corner_panic():
+            if self.mode() == 'foreground' and self._corner_panic():
                 self.log('Cursor hit the corner - emergency stop.')
                 return False
             if (self.mode() == 'foreground' and CONFIG['require_focus']
@@ -326,10 +327,14 @@ class Engine:
             if not name:
                 return
             if self.mode() == 'background':
+                if not background.virtual_key(name):
+                    raise ValueError('unknown key ' + repr(name))
                 target = self.bg_target or background.target_window(self.hwnd)
                 self.bg_target = target
                 if not background.key(target, name, hold):
-                    raise RuntimeError('unknown key ' + repr(name))
+                    self.bg_target = background.target_window(self.hwnd)
+                    if not background.key(self.bg_target, name, hold):
+                        raise RuntimeError('the game refused the key')
                 return
             pydirectinput.keyDown(name)
             self._sleep(hold)
