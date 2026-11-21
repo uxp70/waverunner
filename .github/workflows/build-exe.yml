@@ -24,6 +24,13 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install pyinstaller pydirectinput keyboard
 
+      - name: Read app version
+        id: version
+        run: |
+          $match = Select-String -Path waverunner.py -Pattern "^APP_VERSION = '([0-9][0-9.]*)'" | Select-Object -First 1
+          if (-not $match) { throw 'APP_VERSION not found in waverunner.py' }
+          "version=" + $match.Matches[0].Groups[1].Value >> $env:GITHUB_OUTPUT
+
       - name: Build single-file exe
         run: pyinstaller --noconfirm --clean --onefile --noconsole --name WaveRunner waverunner.py
 
@@ -38,9 +45,13 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'latest' }}
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
+          $notes = "version=$env:VERSION`ncommit=$env:GITHUB_SHA`n`nAutomated Windows build of the current main branch."
           gh release view $env:TAG *> $null
           if ($LASTEXITCODE -ne 0) {
-            gh release create $env:TAG --title WaveRunner --notes 'Automated Windows build of the current main branch.'
+            gh release create $env:TAG --title "WaveRunner $env:VERSION" --notes $notes
+          } else {
+            gh release edit $env:TAG --title "WaveRunner $env:VERSION" --notes $notes
           }
           gh release upload $env:TAG dist/WaveRunner.exe --clobber
