@@ -3,6 +3,13 @@
 WaveRunner - docks a game window to a fixed rectangle and replays a routine of
 mouse clicks and key presses against it.
 
+Two input modes
+  Background  the default. Clicks and keys are posted into the game window, so
+              the real cursor never moves, the real keyboard is untouched and
+              you can keep using your PC while the routine runs.
+  Foreground  moves the real cursor with pydirectinput; the game has to be the
+              active window.
+
 Hotkeys
   F8  start / stop      F9  stop now      F7  record the cursor as a click step
 
@@ -36,6 +43,7 @@ from ctypes import wintypes
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
+import background
 import updater
 
 try:
@@ -49,12 +57,15 @@ except ImportError as exc:
     raise SystemExit('missing dependency: pip install keyboard') from exc
 
 
-APP_VERSION = '1.1.0'
+APP_VERSION = '1.2.0'
 
 CONFIG = {
     'window_title': 'Roblox',
     'dock': {'x': 40, 'y': 40, 'w': 1280, 'h': 760, 'always_on_top': False},
     'hotkeys': {'toggle': 'f8', 'capture': 'f7', 'stop': 'f9'},
+    'input_mode': 'background',
+    'send_to_back': True,
+    'keep_awake': True,
     'loop': True,
     'loop_gap_s': 1.5,
     'require_focus': True,
@@ -70,8 +81,10 @@ user32 = ctypes.windll.user32
 SWP_NOSIZE = 0x0001
 SWP_NOMOVE = 0x0002
 SWP_NOZORDER = 0x0004
+SWP_NOACTIVATE = 0x0010
 SWP_SHOWWINDOW = 0x0040
 HWND_TOP = ctypes.c_void_p(0)
+HWND_BOTTOM = ctypes.c_void_p(1)
 HWND_TOPMOST = ctypes.c_void_p(-1)
 
 user32.SetWindowPos.argtypes = [
@@ -142,11 +155,16 @@ class Engine:
     def __init__(self, log) -> None:
         self.log = log
         self.hwnd = None
+        self.bg_target = None
         self.routine = []
         self.thread = None
         self.stop_event = threading.Event()
         pydirectinput.PAUSE = 0.02
         pydirectinput.FAILSAFE = False
+
+    @staticmethod
+    def mode() -> str:
+        return 'background' if CONFIG['input_mode'] == 'background' else 'foreground'
 
     def dock(self) -> bool:
         self.hwnd = find_window(CONFIG['window_title'], exclude='WaveRunner')
@@ -154,17 +172,26 @@ class Engine:
             self.log('No window matching ' + repr(CONFIG['window_title']) + '. Start the game first.')
             return False
         box = CONFIG['dock']
+        flags = SWP_NOZORDER | SWP_SHOWWINDOW | SWP_NOACTIVATE
         user32.SetWindowPos(
-            self.hwnd, HWND_TOP, box['x'], box['y'], box['w'], box['h'],
-            SWP_NOZORDER | SWP_SHOWWINDOW,
+            self.hwnd, HWND_TOP, box['x'], box['y'], box['w'], box['h'], flags,
         )
         if box['always_on_top']:
-            user32.SetWindowPos(self.hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE)
+            user32.SetWindowPos(self.hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
+        if self.mode() == 'background':
+            if CONFIG['send_to_back']:
+                user32.SetWindowPos(self.hwnd, HWND_BOTTOM, 0, 0, 0, 0,
+                                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
+            self.bg_target = background.target_window(self.hwnd)
+            self.log('Docked to {w}x{h} at ({x}, {y}) - background mode, your desktop stays yours.'.format(
+                w=box['w'], h=box['h'], x=box['x'], y=box['y']))
+            return True
         try:
             user32.SetForegroundWindow(self.hwnd)
         except Exception:
             pass
-        self.log('Docked to {w}x{h} at ({x}, {y}).'.format(
+        self.log('Docked to {w}x{h} at ({x}, {y}) - foreground mode.'.format(
             w=box['w'], h=box['h'], x=box['x'], y=box['y']))
         return True
 
@@ -218,11 +245,18 @@ class Engine:
         if not self.hwnd or not user32.IsWindow(self.hwnd):
             if not self.dock():
                 return
+        if self.mode() == 'background':
+            self.bg_target = background.target_window(self.hwnd)
+            if not self.bg_target:
+                self.log('Could not find the game input surface - dock again.')
+                return
         self.stop_event.clear()
+        if CONFIG['keep_awake']:
+            background.keep_awake()
         self.thread = threading.Thread(target=self._loop, daemon=True)
         self.thread.start()
-        self.log('Running {} steps{}.'.format(
-            len(self.routine), ' on loop' if CONFIG['loop'] else ''))
+        self.log('Running {} steps{} in {} mode.'.format(
+            len(self.routine), ' on loop' if CONFIG['loop'] else '', self.mode()))
 
     def stop(self) -> None:
         self.stop_event.set()
@@ -234,22 +268,27 @@ class Engine:
             self.start()
 
     def _loop(self) -> None:
-        while not self.stop_event.is_set():
-            if not self._run_once():
-                break
-            if not CONFIG['loop']:
-                break
-            self._sleep(CONFIG['loop_gap_s'])
+        try:
+            while not self.stop_event.is_set():
+                if not self._run_once():
+                    break
+                if not CONFIG['loop']:
+                    break
+                self._sleep(CONFIG['loop_gap_s'])
+        finally:
+            if CONFIG['keep_awake']:
+                background.allow_sleep()
         self.log('Stopped.')
 
     def _run_once(self) -> bool:
         for index, step in enumerate(self.routine, start=1):
             if self.stop_event.is_set():
                 return False
-            if self._corner_panic():
+            if self.mode() == 'foreground' and CONFIG['require_focus'] and self._corner_panic():
                 self.log('Cursor hit the corner - emergency stop.')
                 return False
-            if CONFIG['require_focus'] and self.hwnd and not is_foreground(self.hwnd):
+            if (self.mode() == 'foreground' and CONFIG['require_focus']
+                    and self.hwnd and not is_foreground(self.hwnd)):
                 self.log('Game is not the active window - pausing.')
                 return False
             try:
@@ -264,12 +303,20 @@ class Engine:
         kind = step.get('do')
 
         if kind in ('click', 'double', 'move'):
-            x, y = self._screen_point(step.get('at', (0.5, 0.5)))
+            x, y = self._client_point(step.get('at', (0.5, 0.5)))
+            if self.mode() == 'background':
+                if kind == 'move':
+                    background.move(self.hwnd, x, y)
+                elif not background.click(self.hwnd, x, y, step.get('button', 'left'),
+                                          double=(kind == 'double')):
+                    raise RuntimeError('the game refused the click')
+                return
+            sx, sy = self._to_screen(x, y)
             if kind == 'move':
-                pydirectinput.moveTo(x, y)
+                pydirectinput.moveTo(sx, sy)
             else:
                 clicks = 2 if kind == 'double' else 1
-                pydirectinput.click(x, y, clicks=clicks, interval=0.08,
+                pydirectinput.click(sx, sy, clicks=clicks, interval=0.08,
                                     button=step.get('button', 'left'))
             return
 
@@ -277,6 +324,12 @@ class Engine:
             name = str(step.get('key', ''))
             hold = float(step.get('hold', 0.05))
             if not name:
+                return
+            if self.mode() == 'background':
+                target = self.bg_target or background.target_window(self.hwnd)
+                self.bg_target = target
+                if not background.key(target, name, hold):
+                    raise RuntimeError('unknown key ' + repr(name))
                 return
             pydirectinput.keyDown(name)
             self._sleep(hold)
@@ -289,17 +342,24 @@ class Engine:
 
         raise ValueError('unknown step type ' + repr(kind))
 
-    def _screen_point(self, at):
-        ox, oy, w, h = client_geometry(self.hwnd)
+    def _client_point(self, at):
+        '''Routine coordinates as pixels inside the client area, jittered.'''
+        _ox, _oy, w, h = client_geometry(self.hwnd)
         fx = float(at[0])
         fy = float(at[1])
-        x = ox + (fx * w if fx <= 1.0 else fx)
-        y = oy + (fy * h if fy <= 1.0 else fy)
+        x = fx * w if fx <= 1.0 else fx
+        y = fy * h if fy <= 1.0 else fy
         j = CONFIG['jitter']['click_px']
         if j:
             x += random.uniform(-j, j)
             y += random.uniform(-j, j)
-        return int(round(x)), int(round(y))
+        x = int(round(max(0, min(max(0, w - 1), x))))
+        y = int(round(max(0, min(max(0, h - 1), y))))
+        return x, y
+
+    def _to_screen(self, x, y):
+        ox, oy, _w, _h = client_geometry(self.hwnd)
+        return ox + x, oy + y
 
     def _sleep(self, seconds: float) -> None:
         j = CONFIG['jitter']['wait_s']
@@ -319,8 +379,8 @@ class App:
         engine.log = self.log_async
 
         root.title('WaveRunner')
-        root.geometry('660x470')
-        root.minsize(560, 380)
+        root.geometry('680x520')
+        root.minsize(580, 420)
 
         bar = ttk.Frame(root, padding=(10, 10, 10, 4))
         bar.pack(fill='x')
@@ -337,6 +397,15 @@ class App:
         self.status = ttk.Label(bar2, text='idle')
         self.status.pack(side='right')
 
+        bar3 = ttk.Frame(root, padding=(10, 0, 10, 8))
+        bar3.pack(fill='x')
+        ttk.Label(bar3, text='Input:').pack(side='left')
+        self.mode_var = tk.StringVar(value=CONFIG['input_mode'])
+        ttk.Radiobutton(bar3, text='Background - keep using your PC', value='background',
+                        variable=self.mode_var, command=self.set_mode).pack(side='left', padx=4)
+        ttk.Radiobutton(bar3, text='Foreground - moves the real cursor', value='foreground',
+                        variable=self.mode_var, command=self.set_mode).pack(side='left', padx=4)
+
         body = ttk.Frame(root, padding=(10, 0, 10, 10))
         body.pack(fill='both', expand=True)
         self.log_box = tk.Text(body, height=14, wrap='word', state='disabled',
@@ -352,6 +421,7 @@ class App:
 
         engine.load()
         self.log('Ready. Target window: ' + repr(CONFIG['window_title']) + '.')
+        self.log('Background mode: leave the game window visible (not minimised) and use your PC as usual.')
         root.after(800, self.check_updates)
 
     def _bind_hotkeys(self) -> None:
@@ -362,6 +432,14 @@ class App:
             keyboard.add_hotkey(keys['stop'], lambda: self.events.put(('stop', None)))
         except Exception as exc:
             self.log('Global hotkeys unavailable ({}); use the buttons.'.format(exc))
+
+    def set_mode(self) -> None:
+        CONFIG['input_mode'] = self.mode_var.get()
+        if CONFIG['input_mode'] == 'background':
+            self.log('Background input: clicks and keys go straight to the game window; '
+                     'the cursor and keyboard stay yours.')
+        else:
+            self.log('Foreground input: the real cursor moves and the game takes focus.')
 
     def _pump(self) -> None:
         while True:
@@ -476,8 +554,9 @@ class App:
 
     def _refresh_status(self) -> None:
         running = bool(self.engine.thread and self.engine.thread.is_alive())
-        self.status.configure(text='{} - {} steps'.format(
-            'running' if running else 'idle', len(self.engine.routine)))
+        self.status.configure(text='{} - {} steps - {}'.format(
+            'running' if running else 'idle', len(self.engine.routine),
+            CONFIG['input_mode']))
 
     def close(self) -> None:
         self.engine.stop()
