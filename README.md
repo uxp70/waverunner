@@ -4,15 +4,51 @@ A small Windows helper that docks a game window to a fixed rectangle and replays
 mouse clicks and key presses that you record yourself. Nothing is hardcoded to one game or one
 screen size - you place the steps.
 
+It runs in the background: clicks and keys are posted into the game window, so the cursor and
+keyboard stay yours and you can keep using the PC while a routine runs.
+
 ## Download the exe
 
 Grab `WaveRunner.exe` from the [Releases](../../releases) page. You do not need Python to run it.
 
 The exe is built by GitHub Actions on a `windows-latest` runner straight from `waverunner.py`
-(`.github/workflows/build-exe.yml`), so the download always matches this source.
+(`.github/workflows/build-exe.yml`), so the download always matches this source - no local build
+step, no local toolchain.
 
 Windows SmartScreen will warn about an unsigned exe from a small project. Use *More info* then
 *Run anyway*, or build it yourself from source if you would rather.
+
+## Background mode (default)
+
+Waking the macro and then sitting in it was the old limit. The window still has to exist on this
+PC - the game itself cannot run anywhere else - but the macro no longer needs to own your desktop.
+
+| | Background | Foreground |
+| --- | --- | --- |
+| Real cursor moves | no | yes |
+| Game needs focus | no | yes |
+| You can use other apps | yes | no |
+| How input is sent | `PostMessageW` into the window | `SendInput` via pydirectinput |
+
+How it works: `background.py` finds the render window inside the game (the deepest visible child
+under the client area), posts `WM_MOUSEMOVE`, `WM_LBUTTONDOWN`/`WM_LBUTTONUP` and
+`WM_KEYDOWN`/`WM_KEYUP` to it with client-area coordinates, and translates between the docked
+window's coordinates and that child's. It also calls `SetThreadExecutionState`, so Windows does
+not sleep or lock the session while a routine is running. `Send to back` is on, so the game window
+sits behind your work instead of in front of it.
+
+What it will not do, measured rather than guessed:
+
+- **Camera rotation.** Games that read raw mouse motion - Roblox included - do not turn their
+  view from synthetic messages. Walking, clicking, tower placement, upgrades and key abilities
+  all work; turning the camera with the mouse does not. Tower defence play does not need it.
+- **Minimised windows.** Messages still queue for a minimised window, but the game may stop
+  drawing and throttle itself. Leave the window visible, just behind your other windows.
+- **Games that read key state directly.** Roblox handles posted key messages; a game that polls
+  `GetAsyncKeyState` instead would ignore them. Switch the radio button to *Foreground* for those.
+
+Nothing about this is specific to Roblox: it drives whatever window `CONFIG['window_title']`
+matches, and the radio button switches back to real input at any time.
 
 ## Updates
 
@@ -45,14 +81,19 @@ python waverunner.py
 1. Open the game window.
 2. Click **Dock game**. WaveRunner finds the window whose title contains `Roblox`
    (`CONFIG['window_title']`) and snaps it to a fixed 1280x760 rectangle, so coordinates stay
-   where you expect them.
-3. Focus the game, hover a spot, press **F7**. A click step is appended to `routine.json` next to
-   the exe and saved immediately.
-4. **F8** starts and stops the loop, **F9** stops at once, and shoving the cursor into the
-   top-left corner is an emergency stop.
+   where you expect them. In background mode the game is not focused and is pushed behind your
+   windows.
+3. Hover a spot in the game and press **F7**. A click step is appended to `routine.json` next to
+   the exe and saved immediately. Recording works the same in both modes; in background mode the
+   coordinates are read from the docked client area, so keep the window where you docked it.
+4. **F8** starts and stops the loop, **F9** stops at once. Hotkeys are global through the
+   `keyboard` package, so they work from whatever app you are in; run WaveRunner as administrator
+   if a game window that is elevated swallows them.
 
-Guards: it will not click while the game is not the active window, and it adds a little random
-jitter to clicks and waits.
+Guards: background mode posts to one window only and never touches your cursor; foreground mode
+refuses to click while the game is not the active window, and pushing the cursor into the
+top-left corner is an emergency stop. Both add a little random jitter to clicks and waits, and
+both release held keys when you stop.
 
 ## Routine format
 
@@ -71,19 +112,22 @@ steps:
 | --- | --- | --- |
 | `click` | `at`, optional `button` | one click |
 | `double` | `at` | double click |
-| `move` | `at` | move the cursor only |
+| `move` | `at` | move the pointer only |
 | `key` | `key`, optional `hold` | press and release a key |
 | `wait` | `s` | sleep, in seconds |
 
 `at` is `[x, y]`. A value of `1.0` or less is a fraction of the window client area, so a
 routine survives a resize. Anything larger is raw pixels from the client area's top-left
-corner.
+corner. `key` takes a single character (`1`, `e`, `f`) or a name (`space`, `enter`, `esc`,
+`tab`, `shift`, `up`, `f1` ...).
 
 ## Settings
 
 All in the `CONFIG` dict at the top of `waverunner.py`: target window title, dock rectangle,
-hotkeys, loop on/off and gap, focus requirement, jitter amounts, and `check_updates` to turn the
-launch-time check off entirely.
+hotkeys, `input_mode` (`background` or `foreground`), `send_to_back`, `keep_awake`, loop on/off
+and gap, focus requirement for foreground mode, jitter amounts, and `check_updates` to turn the
+launch-time check off entirely. The input mode and update check are also switchable from the
+window at runtime.
 
 ## Build the exe yourself
 
