@@ -10,6 +10,11 @@ Setup
   Python 3.10+ on Windows:  pip install -r requirements.txt
   Build an exe:  pyinstaller --onefile --noconsole --name WaveRunner waverunner.py
 
+Updates
+  Every launch asks the release tagged 'latest' whether a newer build exists
+  (updater.py). A private repository needs a read-only token in
+  update_token.txt beside the exe or in WAVERUNNER_TOKEN.
+
 Routine file: routine.json, a JSON list of steps.
   {'do': 'click', 'at': [0.42, 0.55]}    values <= 1.0 are a fraction of the client area
   {'do': 'click', 'at': [540, 320]}      larger values are raw pixels from the client corner
@@ -31,6 +36,8 @@ from ctypes import wintypes
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
+import updater
+
 try:
     import pydirectinput
 except ImportError as exc:
@@ -42,6 +49,8 @@ except ImportError as exc:
     raise SystemExit('missing dependency: pip install keyboard') from exc
 
 
+APP_VERSION = '1.1.0'
+
 CONFIG = {
     'window_title': 'Roblox',
     'dock': {'x': 40, 'y': 40, 'w': 1280, 'h': 760, 'always_on_top': False},
@@ -51,9 +60,10 @@ CONFIG = {
     'require_focus': True,
     'step_pause_s': 0.03,
     'jitter': {'click_px': 2, 'wait_s': 0.04},
+    'check_updates': True,
 }
 
-ROUTINE_PATH = Path(__file__).with_name('routine.json')
+ROUTINE_PATH = updater.app_dir() / 'routine.json'
 
 user32 = ctypes.windll.user32
 
@@ -342,6 +352,7 @@ class App:
 
         engine.load()
         self.log('Ready. Target window: ' + repr(CONFIG['window_title']) + '.')
+        root.after(800, self.check_updates)
 
     def _bind_hotkeys(self) -> None:
         keys = CONFIG['hotkeys']
@@ -366,8 +377,53 @@ class App:
                 self.stop()
             elif name == 'log':
                 self._append(payload)
+            elif name == 'update':
+                self.offer_update(payload)
+            elif name == 'restart':
+                self._append('Updated to WaveRunner {} - restarting.'.format(payload))
+                self.root.after(400, self.close)
         self._refresh_status()
         self.root.after(60, self._pump)
+
+    def check_updates(self) -> None:
+        if CONFIG['check_updates']:
+            threading.Thread(target=self._check_updates, daemon=True).start()
+
+    def _check_updates(self) -> None:
+        try:
+            info = updater.check(APP_VERSION)
+        except Exception as exc:
+            self.log_async('Update check skipped: {}'.format(exc))
+            return
+        if not info:
+            self.log_async('WaveRunner {} is the newest build.'.format(APP_VERSION))
+            return
+        self.events.put(('update', info))
+
+    def offer_update(self, info) -> None:
+        answer = messagebox.askyesno(
+            'Update available',
+            'WaveRunner {} is available (this copy is {}).\n\n'
+            'Download it and restart now?'.format(info['version'], APP_VERSION),
+            parent=self.root,
+        )
+        if not answer:
+            self.log('Update {} left for later.'.format(info['version']))
+            return
+        self.log('Downloading WaveRunner {}...'.format(info['version']))
+        threading.Thread(target=self._download_update, args=(info,), daemon=True).start()
+
+    def _download_update(self, info) -> None:
+        target = updater.app_dir() / 'WaveRunner.new.exe'
+        try:
+            staged = updater.download(info['asset_url'], target)
+        except Exception as exc:
+            self.log_async('Update failed: {}'.format(exc))
+            return
+        if updater.install(staged):
+            self.events.put(('restart', info['version']))
+        else:
+            self.log_async('Saved {} - run it to update.'.format(staged.name))
 
     def dock(self) -> None:
         self.engine.dock()
