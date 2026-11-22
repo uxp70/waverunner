@@ -19,8 +19,8 @@ Setup
 
 Updates
   Every launch asks the release tagged 'latest' whether a newer build exists
-  (updater.py). A private repository needs a read-only token in
-  update_token.txt beside the exe or in WAVERUNNER_TOKEN.
+  (updater.py) and offers to download it. The repository is public, so the
+  check needs no account or token.
 
 Routine file: routine.json, a JSON list of steps.
   {'do': 'click', 'at': [0.42, 0.55]}    values <= 1.0 are a fraction of the client area
@@ -57,7 +57,7 @@ except ImportError as exc:
     raise SystemExit('missing dependency: pip install keyboard') from exc
 
 
-APP_VERSION = '1.2.0'
+APP_VERSION = '1.2.1'
 
 CONFIG = {
     'window_title': 'Roblox',
@@ -547,6 +547,10 @@ class App:
         self.engine.routine = []
         self.engine.save(silent=True)
         self.log('Routine cleared.')
+
+    def log(self, message: str) -> None:
+        '''Write a line to the log box now; call from the UI thread.'''
+        self._append(message)
 
     def log_async(self, message: str) -> None:
         self.events.put(('log', message))

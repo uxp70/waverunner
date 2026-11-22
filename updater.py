@@ -4,10 +4,9 @@ Reads the GitHub release tagged `latest`, compares the version that release was
 built from with the running copy, and - once the user agrees - downloads the
 newer executable, swaps it in and restarts the app.
 
-The repository is private, so GitHub only answers with a token. Put a
-fine-grained, read-only token in update_token.txt next to the executable, or in
-the WAVERUNNER_TOKEN environment variable. Without one the check is skipped and
-the app runs as normal.
+The repository is public, so GitHub answers anonymous requests; no token is
+stored or needed. WAVERUNNER_TOKEN and update_token.txt are still honoured if
+they exist, for anyone pointing this at a private fork.
 '''
 from __future__ import annotations
 
@@ -110,7 +109,7 @@ def check(current):
             release = json.loads(resp.read().decode('utf-8'))
     except urllib.error.HTTPError as exc:
         if exc.code in (401, 403, 404):
-            raise LookupError('release not readable; a private repo needs ' + TOKEN_FILE) from exc
+            raise LookupError('release not readable; GitHub answered {}'.format(exc.code)) from exc
         raise
     remote = release_version(release)
     if not remote:
