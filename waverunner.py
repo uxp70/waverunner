@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 '''
-WaveRunner - docks a game window to a fixed rectangle and replays a routine of
-mouse clicks and key presses against it.
+WaveRunner - embeds a game window inside the app, lays a routine of mouse
+clicks and key presses over it, and keeps working while you use your PC.
 
 Two input modes
   Background  the default. Clicks and keys are posted into the game window, so
@@ -44,6 +44,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 import background
+import embed
 import updater
 
 try:
@@ -57,7 +58,7 @@ except ImportError as exc:
     raise SystemExit('missing dependency: pip install keyboard') from exc
 
 
-APP_VERSION = '1.2.1'
+APP_VERSION = '1.3.0'
 
 CONFIG = {
     'window_title': 'Roblox',
@@ -159,6 +160,8 @@ class Engine:
         self.routine = []
         self.thread = None
         self.stop_event = threading.Event()
+        self.stats = {'loops': 0, 'steps': 0, 'clicks': 0, 'keys': 0,
+                      'started': 0.0, 'last_error': ''}
         pydirectinput.PAUSE = 0.02
         pydirectinput.FAILSAFE = False
 
@@ -251,6 +254,8 @@ class Engine:
                 self.log('Could not find the game input surface - dock again.')
                 return
         self.stop_event.clear()
+        self.stats.update(loops=0, steps=0, clicks=0, keys=0,
+                          started=time.time(), last_error='')
         self.thread = threading.Thread(target=self._loop, daemon=True)
         self.thread.start()
         self.log('Running {} steps{} in {} mode.'.format(
@@ -273,6 +278,7 @@ class Engine:
             while not self.stop_event.is_set():
                 if not self._run_once():
                     break
+                self.stats['loops'] += 1
                 if not CONFIG['loop']:
                     break
                 self._sleep(CONFIG['loop_gap_s'])
@@ -295,13 +301,20 @@ class Engine:
             try:
                 self._exec(step)
             except Exception as exc:
+                self.stats['last_error'] = str(exc)
                 self.log('Step {} failed: {}'.format(index, exc))
                 return False
+            self.stats['steps'] += 1
             time.sleep(CONFIG['step_pause_s'])
         return True
 
     def _exec(self, step) -> None:
         kind = step.get('do')
+        if kind in ('click', 'double'):
+            self.stats['clicks'] += 1
+        elif kind == 'key':
+            self.stats['keys'] += 1
+
 
         if kind in ('click', 'double', 'move'):
             x, y = self._client_point(step.get('at', (0.5, 0.5)))
@@ -377,57 +390,342 @@ class Engine:
 
 
 class App:
+    '''Game on the left, steps / log / session on the right.'''
+
     def __init__(self, root, engine) -> None:
         self.root = root
         self.engine = engine
         self.events = queue.Queue()
+        self.target_var = tk.StringVar(value=CONFIG['window_title'])
         engine.log = self.log_async
 
-        root.title('WaveRunner')
-        root.geometry('680x520')
-        root.minsize(580, 420)
+        root.title('WaveRunner ' + APP_VERSION)
+        root.geometry('1180x740')
+        root.minsize(940, 600)
 
-        bar = ttk.Frame(root, padding=(10, 10, 10, 4))
-        bar.pack(fill='x')
-        ttk.Button(bar, text='Dock game', command=self.dock).pack(side='left')
-        ttk.Button(bar, text='Start (F8)', command=self.toggle).pack(side='left', padx=6)
-        ttk.Button(bar, text='Stop (F9)', command=self.stop).pack(side='left')
-        ttk.Button(bar, text='Record click (F7)', command=self.capture).pack(side='left', padx=6)
-
-        bar2 = ttk.Frame(root, padding=(10, 0, 10, 6))
-        bar2.pack(fill='x')
-        ttk.Button(bar2, text='Load routine', command=self.load).pack(side='left')
-        ttk.Button(bar2, text='Save routine', command=self.save).pack(side='left', padx=6)
-        ttk.Button(bar2, text='Clear', command=self.clear).pack(side='left')
-        self.status = ttk.Label(bar2, text='idle')
-        self.status.pack(side='right')
-
-        bar3 = ttk.Frame(root, padding=(10, 0, 10, 8))
-        bar3.pack(fill='x')
-        ttk.Label(bar3, text='Input:').pack(side='left')
-        self.mode_var = tk.StringVar(value=CONFIG['input_mode'])
-        ttk.Radiobutton(bar3, text='Background - keep using your PC', value='background',
-                        variable=self.mode_var, command=self.set_mode).pack(side='left', padx=4)
-        ttk.Radiobutton(bar3, text='Foreground - moves the real cursor', value='foreground',
-                        variable=self.mode_var, command=self.set_mode).pack(side='left', padx=4)
-
-        body = ttk.Frame(root, padding=(10, 0, 10, 10))
-        body.pack(fill='both', expand=True)
-        self.log_box = tk.Text(body, height=14, wrap='word', state='disabled',
-                               font=('Consolas', 9))
-        scroll = ttk.Scrollbar(body, command=self.log_box.yview)
-        self.log_box.configure(yscrollcommand=scroll.set)
-        self.log_box.pack(side='left', fill='both', expand=True)
-        scroll.pack(side='right', fill='y')
-
+        self._build_top()
+        self._build_body()
         self._bind_hotkeys()
+        self.game_frame.bind('<Configure>', lambda _event: self._fit_game())
         root.protocol('WM_DELETE_WINDOW', self.close)
         root.after(60, self._pump)
 
         engine.load()
-        self.log('Ready. Target window: ' + repr(CONFIG['window_title']) + '.')
-        self.log('Background mode: leave the game window visible (not minimised) and use your PC as usual.')
+        self._refresh_steps()
+        self.log('Ready. Game window: ' + repr(CONFIG['window_title']) + '.')
+        self.log('Dock the game to show it in this window and keep using your PC.')
         root.after(800, self.check_updates)
+
+    # ---------------------------------------------------------------- layout
+
+    def _build_top(self) -> None:
+        bar = ttk.Frame(self.root, padding=(10, 10, 10, 4))
+        bar.pack(fill='x')
+        ttk.Button(bar, text='Dock game', command=self.dock).pack(side='left')
+        ttk.Button(bar, text='Undock', command=self.undock).pack(side='left', padx=6)
+        ttk.Button(bar, text='Start (F8)', command=self.toggle).pack(side='left')
+        ttk.Button(bar, text='Stop (F9)', command=self.stop).pack(side='left', padx=6)
+        ttk.Button(bar, text='Record click (F7)', command=self.capture).pack(side='left')
+        self.status = ttk.Label(bar, text='idle')
+        self.status.pack(side='right')
+
+        row = ttk.Frame(self.root, padding=(10, 0, 10, 6))
+        row.pack(fill='x')
+        ttk.Label(row, text='Window title:').pack(side='left')
+        entry = ttk.Entry(row, textvariable=self.target_var, width=18)
+        entry.pack(side='left', padx=4)
+        entry.bind('<Return>', lambda _event: self.set_target())
+        ttk.Button(row, text='Use', width=5, command=self.set_target).pack(side='left')
+        ttk.Label(row, text='Input:').pack(side='left', padx=(16, 4))
+        self.mode_var = tk.StringVar(value=CONFIG['input_mode'])
+        ttk.Radiobutton(row, text='Background', value='background',
+                        variable=self.mode_var,
+                        command=self.set_mode).pack(side='left')
+        ttk.Radiobutton(row, text='Foreground', value='foreground',
+                        variable=self.mode_var,
+                        command=self.set_mode).pack(side='left', padx=6)
+        self.loop_var = tk.BooleanVar(value=CONFIG['loop'])
+        ttk.Checkbutton(row, text='Loop', variable=self.loop_var,
+                        command=self.set_loop).pack(side='left', padx=(16, 0))
+
+    def _build_body(self) -> None:
+        body = ttk.Frame(self.root, padding=(10, 0, 10, 10))
+        body.pack(fill='both', expand=True)
+
+        self.game_frame = tk.Frame(body, bg='#0f1216', highlightthickness=1,
+                                   highlightbackground='#2b323a')
+        self.game_frame.pack(side='left', fill='both', expand=True)
+        self.game_hint = tk.Label(
+            self.game_frame, bg='#0f1216', fg='#7b8794', justify='center',
+            text='Game window\n\nDock the game to show it here.',
+        )
+        self.game_hint.place(relx=0.5, rely=0.5, anchor='center')
+
+        side = ttk.Frame(body, width=400)
+        side.pack(side='right', fill='y', padx=(10, 0))
+        side.pack_propagate(False)
+        self.tabs = ttk.Notebook(side)
+        self.tabs.pack(fill='both', expand=True)
+        self._build_steps_tab()
+        self._build_log_tab()
+        self._build_session_tab()
+
+    def _build_steps_tab(self) -> None:
+        tab = ttk.Frame(self.tabs, padding=8)
+        self.tabs.add(tab, text='Config')
+
+        holder = ttk.Frame(tab)
+        holder.pack(fill='both', expand=True)
+        self.tree = ttk.Treeview(holder, columns=('n', 'do', 'target'),
+                                 show='headings', height=16, selectmode='browse')
+        for column, label, width, stretch in (
+            ('n', '#', 36, False),
+            ('do', 'Step', 84, False),
+            ('target', 'Target', 210, True),
+        ):
+            self.tree.heading(column, text=label)
+            self.tree.column(column, width=width, anchor='w', stretch=stretch)
+        scroll = ttk.Scrollbar(holder, command=self.tree.yview)
+        self.tree.configure(yscrollcommand=scroll.set)
+        self.tree.pack(side='left', fill='both', expand=True)
+        scroll.pack(side='right', fill='y')
+        self.tree.bind('<Double-1>', lambda _event: self.edit_step())
+
+        edit_row = ttk.Frame(tab)
+        edit_row.pack(fill='x', pady=(8, 0))
+        ttk.Button(edit_row, text='Add', width=6, command=self.add_step).pack(side='left')
+        ttk.Button(edit_row, text='Edit', width=6, command=self.edit_step).pack(side='left', padx=4)
+        ttk.Button(edit_row, text='Delete', width=7, command=self.delete_step).pack(side='left')
+        ttk.Button(edit_row, text='Up', width=4,
+                   command=lambda: self.move_step(-1)).pack(side='left', padx=(10, 2))
+        ttk.Button(edit_row, text='Down', width=6,
+                   command=lambda: self.move_step(1)).pack(side='left')
+
+        file_row = ttk.Frame(tab)
+        file_row.pack(fill='x', pady=(6, 0))
+        ttk.Button(file_row, text='Load routine', command=self.load).pack(side='left')
+        ttk.Button(file_row, text='Save routine', command=self.save).pack(side='left', padx=4)
+        ttk.Button(file_row, text='Clear', command=self.clear).pack(side='left')
+
+    def _build_log_tab(self) -> None:
+        tab = ttk.Frame(self.tabs, padding=8)
+        self.tabs.add(tab, text='Log')
+        self.log_box = tk.Text(tab, wrap='word', state='disabled',
+                               font=('Consolas', 9), bg='#0f1216', fg='#c8d1db',
+                               insertbackground='#c8d1db', relief='flat')
+        scroll = ttk.Scrollbar(tab, command=self.log_box.yview)
+        self.log_box.configure(yscrollcommand=scroll.set)
+        self.log_box.pack(side='left', fill='both', expand=True)
+        scroll.pack(side='right', fill='y')
+
+    def _build_session_tab(self) -> None:
+        tab = ttk.Frame(self.tabs, padding=10)
+        self.tabs.add(tab, text='Session')
+        self.session = {
+            'mode': tk.StringVar(value='-'),
+            'runtime': tk.StringVar(value='00:00:00'),
+            'loops': tk.StringVar(value='0'),
+            'steps': tk.StringVar(value='0'),
+            'clicks': tk.StringVar(value='0'),
+            'keys': tk.StringVar(value='0'),
+            'error': tk.StringVar(value='none'),
+        }
+        rows = (
+            ('Input mode', 'mode'),
+            ('Running for', 'runtime'),
+            ('Runs finished', 'loops'),
+            ('Steps sent', 'steps'),
+            ('Clicks sent', 'clicks'),
+            ('Keys sent', 'keys'),
+            ('Last error', 'error'),
+        )
+        for index, (label, key) in enumerate(rows):
+            ttk.Label(tab, text=label).grid(row=index, column=0, sticky='w', pady=3)
+            ttk.Label(tab, textvariable=self.session[key]).grid(row=index, column=1, sticky='e', pady=3)
+        tab.columnconfigure(1, weight=1)
+
+    # ------------------------------------------------------------------ dock
+
+    def set_target(self) -> None:
+        title = self.target_var.get().strip()
+        CONFIG['window_title'] = title or 'Roblox'
+        self.target_var.set(CONFIG['window_title'])
+        self.log('Target window is now ' + repr(CONFIG['window_title']) + '.')
+
+    def dock(self) -> None:
+        if not self.engine.dock():
+            return
+        try:
+            embed.attach(self.engine.hwnd, self.game_frame.winfo_id())
+        except Exception as exc:
+            self.log('Could not embed the game ({}); it stays a separate window.'.format(exc))
+            return
+        self.game_hint.place_forget()
+        self.root.after(60, self._fit_game)
+        self.log('Game embedded in this window.')
+
+    def undock(self) -> None:
+        hwnd = self.engine.hwnd
+        if not hwnd:
+            return
+        embed.detach(hwnd)
+        box = CONFIG['dock']
+        user32.SetWindowPos(hwnd, HWND_TOP, box['x'], box['y'], box['w'], box['h'],
+                            SWP_SHOWWINDOW | SWP_NOACTIVATE)
+        self.game_hint.place(relx=0.5, rely=0.5, anchor='center')
+        self.log('Game window is separate again.')
+
+    def _fit_game(self) -> None:
+        hwnd = self.engine.hwnd
+        if not hwnd or not embed.embedded(hwnd):
+            return
+        width = self.game_frame.winfo_width()
+        height = self.game_frame.winfo_height()
+        if width > 40 and height > 40:
+            embed.move(hwnd, 0, 0, width, height)
+
+    # ----------------------------------------------------------------- steps
+
+    def _refresh_steps(self) -> None:
+        self.tree.delete(*self.tree.get_children())
+        for index, step in enumerate(self.engine.routine):
+            kind = str(step.get('do', '?'))
+            target = ''
+            if kind in ('click', 'double', 'move'):
+                at = step.get('at', [0.5, 0.5])
+                try:
+                    target = '({:.3f}, {:.3f})'.format(float(at[0]), float(at[1]))
+                except (TypeError, ValueError, IndexError):
+                    target = str(at)
+                if kind == 'click' and step.get('button', 'left') != 'left':
+                    target += ' ' + str(step['button'])
+            elif kind == 'key':
+                target = '{}  hold {:.2f}s'.format(step.get('key', ''),
+                                                   float(step.get('hold', 0.05)))
+            elif kind == 'wait':
+                target = '{:.2f}s'.format(float(step.get('s', 0.5)))
+            self.tree.insert('', 'end', iid=str(index), values=(index + 1, kind, target))
+
+    def _selected_index(self):
+        chosen = self.tree.selection()
+        if not chosen:
+            return None
+        return int(chosen[0])
+
+    def add_step(self) -> None:
+        step = self._step_dialog()
+        if not step:
+            return
+        self.engine.routine.append(step)
+        self.engine.save(silent=True)
+        self._refresh_steps()
+        last = str(len(self.engine.routine) - 1)
+        self.tree.selection_set(last)
+        self.tree.see(last)
+
+    def edit_step(self) -> None:
+        index = self._selected_index()
+        if index is None:
+            return
+        step = self._step_dialog(self.engine.routine[index])
+        if not step:
+            return
+        self.engine.routine[index] = step
+        self.engine.save(silent=True)
+        self._refresh_steps()
+        self.tree.selection_set(str(index))
+
+    def delete_step(self) -> None:
+        index = self._selected_index()
+        if index is None:
+            return
+        del self.engine.routine[index]
+        self.engine.save(silent=True)
+        self._refresh_steps()
+
+    def move_step(self, delta: int) -> None:
+        index = self._selected_index()
+        if index is None:
+            return
+        target = index + delta
+        if not 0 <= target < len(self.engine.routine):
+            return
+        routine = self.engine.routine
+        routine[index], routine[target] = routine[target], routine[index]
+        self.engine.save(silent=True)
+        self._refresh_steps()
+        self.tree.selection_set(str(target))
+
+    def _step_dialog(self, step=None):
+        '''Small modal editor; returns the new step dict or None.'''
+        current = step or {}
+        result = {}
+        win = tk.Toplevel(self.root)
+        win.title('Edit step' if step else 'Add step')
+        win.resizable(False, False)
+        win.transient(self.root)
+
+        kind_var = tk.StringVar(value=str(current.get('do', 'click')))
+        at = current.get('at', (0.5, 0.5))
+        try:
+            ax, ay = float(at[0]), float(at[1])
+        except (TypeError, ValueError, IndexError):
+            ax = ay = 0.5
+        x_var = tk.StringVar(value='{:.4f}'.format(ax))
+        y_var = tk.StringVar(value='{:.4f}'.format(ay))
+        key_var = tk.StringVar(value=str(current.get('key', '1')))
+        hold_var = tk.StringVar(value=str(current.get('hold', 0.05)))
+        wait_var = tk.StringVar(value=str(current.get('s', 0.5)))
+
+        box = ttk.Frame(win, padding=12)
+        box.pack(fill='both', expand=True)
+        ttk.Label(box, text='Step').grid(row=0, column=0, sticky='w')
+        ttk.Combobox(box, textvariable=kind_var, state='readonly', width=14,
+                     values=('click', 'double', 'move', 'key', 'wait')
+                     ).grid(row=0, column=1, sticky='we', pady=2)
+        ttk.Label(box, text='X (0-1 = fraction)').grid(row=1, column=0, sticky='w')
+        ttk.Entry(box, textvariable=x_var, width=14).grid(row=1, column=1, sticky='we', pady=2)
+        ttk.Label(box, text='Y (0-1 = fraction)').grid(row=2, column=0, sticky='w')
+        ttk.Entry(box, textvariable=y_var, width=14).grid(row=2, column=1, sticky='we', pady=2)
+        ttk.Label(box, text='Key').grid(row=3, column=0, sticky='w')
+        ttk.Entry(box, textvariable=key_var, width=14).grid(row=3, column=1, sticky='we', pady=2)
+        ttk.Label(box, text='Hold (s)').grid(row=4, column=0, sticky='w')
+        ttk.Entry(box, textvariable=hold_var, width=14).grid(row=4, column=1, sticky='we', pady=2)
+        ttk.Label(box, text='Wait (s)').grid(row=5, column=0, sticky='w')
+        ttk.Entry(box, textvariable=wait_var, width=14).grid(row=5, column=1, sticky='we', pady=2)
+
+        def accept() -> None:
+            kind = kind_var.get()
+            built = {'do': kind}
+            try:
+                if kind in ('click', 'double', 'move'):
+                    built['at'] = [round(float(x_var.get()), 4), round(float(y_var.get()), 4)]
+                    if kind == 'click':
+                        built['button'] = 'left'
+                elif kind == 'key':
+                    name = key_var.get().strip()
+                    if not name:
+                        raise ValueError('a key name is needed')
+                    built['key'] = name
+                    built['hold'] = max(0.0, float(hold_var.get()))
+                elif kind == 'wait':
+                    built['s'] = max(0.0, float(wait_var.get()))
+            except ValueError as exc:
+                messagebox.showerror('Step', str(exc), parent=win)
+                return
+            result.update(built)
+            win.destroy()
+
+        buttons = ttk.Frame(box)
+        buttons.grid(row=6, column=0, columnspan=2, sticky='e', pady=(10, 0))
+        ttk.Button(buttons, text='Cancel', command=win.destroy).pack(side='right')
+        ttk.Button(buttons, text='OK', command=accept).pack(side='right', padx=6)
+
+        win.grab_set()
+        win.wait_window()
+        return result or None
+
+    # --------------------------------------------------------------- actions
 
     def _bind_hotkeys(self) -> None:
         keys = CONFIG['hotkeys']
@@ -445,6 +743,10 @@ class App:
                      'the cursor and keyboard stay yours.')
         else:
             self.log('Foreground input: the real cursor moves and the game takes focus.')
+
+    def set_loop(self) -> None:
+        CONFIG['loop'] = bool(self.loop_var.get())
+        self.log('Looping {}.'.format('on' if CONFIG['loop'] else 'off'))
 
     def _pump(self) -> None:
         while True:
@@ -508,9 +810,6 @@ class App:
         else:
             self.log_async('Saved {} - run it to update.'.format(staged.name))
 
-    def dock(self) -> None:
-        self.engine.dock()
-
     def toggle(self) -> None:
         self.engine.toggle()
 
@@ -519,6 +818,7 @@ class App:
 
     def capture(self) -> None:
         self.engine.capture()
+        self._refresh_steps()
 
     def load(self) -> None:
         path = filedialog.askopenfilename(
@@ -528,6 +828,7 @@ class App:
         )
         if path:
             self.engine.load(Path(path))
+            self._refresh_steps()
 
     def save(self) -> None:
         path = filedialog.asksaveasfilename(
@@ -539,14 +840,19 @@ class App:
         )
         if path:
             self.engine.save(Path(path))
+            self._refresh_steps()
 
     def clear(self) -> None:
         count = len(self.engine.routine)
-        if count and not messagebox.askyesno('Clear routine', 'Delete all {} steps?'.format(count)):
+        if count and not messagebox.askyesno('Clear routine',
+                                             'Delete all {} steps?'.format(count)):
             return
         self.engine.routine = []
         self.engine.save(silent=True)
+        self._refresh_steps()
         self.log('Routine cleared.')
+
+    # ------------------------------------------------------------------- log
 
     def log(self, message: str) -> None:
         '''Write a line to the log box now; call from the UI thread.'''
@@ -556,19 +862,31 @@ class App:
         self.events.put(('log', message))
 
     def _append(self, message: str) -> None:
+        stamp = time.strftime('%H:%M:%S')
         self.log_box.configure(state='normal')
-        self.log_box.insert('end', message + '\n')
+        self.log_box.insert('end', '[{}] {}\n'.format(stamp, message))
         self.log_box.see('end')
         self.log_box.configure(state='disabled')
 
     def _refresh_status(self) -> None:
+        stats = self.engine.stats
         running = bool(self.engine.thread and self.engine.thread.is_alive())
         self.status.configure(text='{} - {} steps - {}'.format(
-            'running' if running else 'idle', len(self.engine.routine),
-            CONFIG['input_mode']))
+            'running' if running else 'idle', len(self.engine.routine), CONFIG['input_mode']))
+        elapsed = int(time.time() - stats['started']) if running and stats['started'] else 0
+        self.session['mode'].set(CONFIG['input_mode'])
+        self.session['runtime'].set('{:02d}:{:02d}:{:02d}'.format(
+            elapsed // 3600, (elapsed % 3600) // 60, elapsed % 60))
+        self.session['loops'].set(str(stats['loops']))
+        self.session['steps'].set(str(stats['steps']))
+        self.session['clicks'].set(str(stats['clicks']))
+        self.session['keys'].set(str(stats['keys']))
+        self.session['error'].set(stats['last_error'] or 'none')
 
     def close(self) -> None:
         self.engine.stop()
+        if self.engine.hwnd:
+            embed.detach(self.engine.hwnd)
         try:
             keyboard.unhook_all()
         except Exception:
